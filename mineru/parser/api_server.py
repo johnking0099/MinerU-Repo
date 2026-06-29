@@ -17,7 +17,9 @@ import os
 import pathlib
 import secrets
 import shutil
+import sys
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -34,6 +36,7 @@ from ..types import Tier
 from .tier import PARSER_BACKENDS, resolve_tier_and_backend
 
 _API_SERVER_BACKENDS = tuple(backend for backend in PARSER_BACKENDS if backend != "flash")
+_MANAGED_PARSE_SERVER_ENV = "MINERU_MANAGED_PARSE_SERVER"
 
 # ── literal type aliases ────────────────────────────────────────────
 
@@ -90,6 +93,27 @@ def _env_flag(name: str, default: bool = True) -> bool:
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _install_managed_parse_server_stdin_watcher(server: Any) -> threading.Thread | None:
+    if not _env_flag(_MANAGED_PARSE_SERVER_ENV, default=False):
+        return None
+
+    def _watch_stdin_for_eof() -> None:
+        stdin_stream = getattr(sys.stdin, "buffer", sys.stdin)
+        try:
+            stdin_stream.read()
+        except Exception:
+            return
+        server.should_exit = True
+
+    watcher = threading.Thread(
+        target=_watch_stdin_for_eof,
+        name="mineru-managed-parse-server-stdin-sentinel",
+        daemon=True,
+    )
+    watcher.start()
+    return watcher
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2161,24 +2185,28 @@ def main(
     """Start the MinerU v1 REST API server."""
     import uvicorn
 
-    uvicorn.run(
-        create_app(
-            upload_dir=upload_dir,
-            tier=tier,
-            backend=backend,
-            concurrency=concurrency,
-            url_timeout=url_timeout,
-            max_wait=max_wait,
-            api_key=api_key,
-            language=language,
-            ocr_mode=ocr_mode,
-            table_enable=not disable_table,
-            formula_enable=not disable_formula,
-            image_analysis=not disable_image_analysis,
-        ),
+    app = create_app(
+        upload_dir=upload_dir,
+        tier=tier,
+        backend=backend,
+        concurrency=concurrency,
+        url_timeout=url_timeout,
+        max_wait=max_wait,
+        api_key=api_key,
+        language=language,
+        ocr_mode=ocr_mode,
+        table_enable=not disable_table,
+        formula_enable=not disable_formula,
+        image_analysis=not disable_image_analysis,
+    )
+    config = uvicorn.Config(
+        app,
         host=host,
         port=port,
     )
+    server = uvicorn.Server(config)
+    _install_managed_parse_server_stdin_watcher(server)
+    server.run()
 
 
 if __name__ == "__main__":
