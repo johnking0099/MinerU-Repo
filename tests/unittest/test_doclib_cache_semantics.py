@@ -29,7 +29,7 @@ from mineru.doclib.core.db import DatabaseManager
 from mineru.doclib.core.file_io import FileStat, get_file_stat
 from mineru.doclib.core.fts import FTSManager
 from mineru.doclib.config_defaults import CONFIG_DEFAULTS
-from mineru.errors import InvalidRequestError
+from mineru.errors import InvalidRequestError, NotFoundError
 from mineru.doclib.services.cleanup_svc import CleanupService
 from mineru.doclib.services.config_svc import ConfigService
 from mineru.doclib.services import parse_svc as parse_svc_module
@@ -48,7 +48,7 @@ from mineru.doclib.services.scan_svc import ScanService
 from mineru.doclib.services.search_svc import SearchService
 from mineru.doclib.locators import ContentCursor
 from mineru.doclib.server import DoclibServer, _ReadPlan
-from mineru.doclib.types import ParseResponse, WatchRequest
+from mineru.doclib.types import DocContentExportRequest, InvalidateRequest, ParseResponse, WatchRequest
 from mineru.parser import backend_for_tier, resolve_tier_and_backend
 from mineru.parser.base import ParseResult
 from mineru.schema.middle_json import MIDDLE_JSON_SCHEMA_VERSION
@@ -143,7 +143,7 @@ class _FakeDB:
             path = params[0]
             if self.file_row and self.file_row["path"] == path and self.file_row["status"] == "active":
                 return self.file_row
-        if sql.startswith("SELECT page_count FROM docs WHERE sha256="):
+        if sql.startswith("SELECT page_count FROM docs WHERE sha256=") or sql.startswith("SELECT * FROM docs WHERE sha256="):
             sha256 = params[0]
             if self.doc_row and self.doc_row["sha256"] == sha256:
                 return self.doc_row
@@ -246,6 +246,13 @@ def _image_page(image_path: str, image_bytes: bytes = b"image-bytes") -> PageInf
     )
     image_block = Block(index=0, type=BlockType.IMAGE, bbox=(1, 1, 20, 20), blocks=[body])
     return PageInfo(page_idx=0, page_size=(100, 100), para_blocks=[image_block], _backend="vlm")
+
+
+def _text_page(text: str) -> PageInfo:
+    span = Span(type=ContentType.TEXT, bbox=(1, 1, 20, 10), content=text)
+    line = Line(bbox=(1, 1, 20, 10), spans=[span])
+    block = Block(index=0, type=BlockType.TEXT, bbox=(1, 1, 20, 10), lines=[line])
+    return PageInfo(page_idx=0, page_size=(100, 100), para_blocks=[block], _backend="vlm")
 
 
 def test_load_pages_from_done_batches_keeps_newest_page_idx(tmp_path: Path) -> None:
@@ -801,16 +808,21 @@ def test_request_parse_explicit_image_ingests_and_queues_parse(tmp_path: Path, m
 
         result = await service.request_parse(str(source), tier="flash")
         file_row = await db.fetchone("SELECT path, ext, sha256, status FROM files WHERE path=?", (str(source),))
-        doc_row = await db.fetchone("SELECT file_type, page_count, is_image_based FROM docs WHERE sha256=?", (result.sha256,))
+        doc_row = await db.fetchone(
+            "SELECT short_id, file_type, page_count, is_image_based FROM docs WHERE sha256=?",
+            (result.sha256,),
+        )
         parse_rows = await db.fetchall("SELECT tier, page_range, status FROM parses WHERE sha256=?", (result.sha256,))
 
         assert result.status == "pending"
         assert result.tier == "flash"
+        assert doc_row is not None
+        assert result.short_id == doc_row["short_id"]
         assert file_row is not None
         assert file_row["ext"] == "png"
         assert file_row["sha256"] == result.sha256
         assert file_row["status"] == "active"
-        assert doc_row == {"file_type": "image", "page_count": 1, "is_image_based": 1}
+        assert doc_row == {"short_id": result.short_id, "file_type": "image", "page_count": 1, "is_image_based": 1}
         assert parse_rows == [{"tier": "flash", "page_range": "1", "status": "pending"}]
 
     asyncio.run(_run())
@@ -996,7 +1008,7 @@ def test_force_request_reuses_active_and_creates_only_uncovered_parse(tmp_path: 
             "first_seen_at": 100,
             "updated_at": 100,
         },
-        doc_row={"sha256": sha256, "page_count": 10},
+        doc_row={"sha256": sha256, "short_id": "eeeeeee", "page_count": 10},
     )
     service = ParseService(db=db, fts=_FakeFTS(), config_svc=None, data_dir=str(tmp_path), parse_lock_timeout_sec=1800)
 
@@ -1007,6 +1019,7 @@ def test_force_request_reuses_active_and_creates_only_uncovered_parse(tmp_path: 
     assert result.reused_parse_ids == [11]
     assert result.created_parse_ids == [12]
     assert result.page_range == "1~10"
+    assert result.short_id == "eeeeeee"
     assert result.status == "pending"
     assert result.cache_hit is False
     assert db.updated_priorities == [11]
@@ -1370,11 +1383,13 @@ def test_search_filters_by_tier_min_tier_and_file_type(tmp_path: Path) -> None:
 
         assert exact_total == 1
         assert [row["tier"] for row in exact_results] == ["standard"]
+        assert [row["short_id"] for row in exact_results] == ["2" * 7]
         assert [row["page_count"] for row in exact_results] == [12]
         assert min_total == 2
         assert {row["tier"] for row in min_results} == {"standard", "pro"}
         assert type_total == 1
         assert [row["filename"] for row in type_results] == ["pro.docx"]
+        assert [row["short_id"] for row in type_results] == ["3" * 7]
         assert [row["page_count"] for row in type_results] == [23]
 
     asyncio.run(_run())
@@ -1914,13 +1929,17 @@ def test_watch_ids_are_stable_standard_library_hashes(tmp_path: Path) -> None:
 
 
 def test_doclib_server_list_responses_include_pagination_metadata(tmp_path: Path) -> None:
+    class _NoopParseService:
+        async def ensure_ingested(self, path: str) -> None:
+            return None
+
     async def _run() -> None:
         db = DatabaseManager(str(tmp_path / "doclib.db"))
         await db.initialize()
         config_svc = ConfigService(db)
         parse_svc = ParseService(db=db, fts=FTSManager(db), config_svc=config_svc, data_dir=str(tmp_path / "data"), parse_lock_timeout_sec=1800)
         scan_svc = ScanService(db=db, config_svc=config_svc, parse_svc=parse_svc, scan_lock_timeout_sec=1800)
-        server = DoclibServer(SimpleNamespace(db=db, scan_svc=scan_svc))
+        server = DoclibServer(SimpleNamespace(db=db, scan_svc=scan_svc, parse_svc=_NoopParseService()))
 
         for index in range(3):
             sha256 = str(index + 1) * 64
@@ -1944,6 +1963,7 @@ def test_doclib_server_list_responses_include_pagination_metadata(tmp_path: Path
             )
 
         parses = await server.list_parses(limit=1, offset=1)
+        files = await server.list_files(limit=1, offset=1)
         scans = await server.list_scans(limit=1, offset=1)
         docs = await server.list_docs(file_type="pdf", limit=1, offset=1)
 
@@ -1951,6 +1971,18 @@ def test_doclib_server_list_responses_include_pagination_metadata(tmp_path: Path
         assert parses.limit == 1
         assert parses.offset == 1
         assert len(parses.parses) == 1
+        assert parses.parses[0].short_id == "2" * 7
+
+        assert files.total == 3
+        assert files.limit == 1
+        assert files.offset == 1
+        assert len(files.files) == 1
+        assert files.files[0].short_id == "2" * 7
+
+        file_detail = await server.get_file_by_path(str(tmp_path / "doc-1.pdf"))
+        assert file_detail.file.short_id == "2" * 7
+        assert len(file_detail.active_parses) == 1
+        assert file_detail.active_parses[0].short_id == "2" * 7
 
         assert scans.total == 3
         assert scans.limit == 1
@@ -1961,6 +1993,108 @@ def test_doclib_server_list_responses_include_pagination_metadata(tmp_path: Path
         assert docs.limit == 1
         assert docs.offset == 1
         assert len(docs.docs) == 1
+
+    asyncio.run(_run())
+
+
+def test_doclib_server_accepts_short_id_for_sha256_doc_inputs(tmp_path: Path) -> None:
+    async def _run() -> None:
+        db = DatabaseManager(str(tmp_path / "doclib.db"))
+        await db.initialize()
+        config_svc = ConfigService(db)
+        fts = FTSManager(db)
+        parse_svc = ParseService(
+            db=db,
+            fts=fts,
+            config_svc=config_svc,
+            data_dir=str(tmp_path),
+            parse_lock_timeout_sec=1800,
+        )
+        server = DoclibServer(SimpleNamespace(db=db, data_dir=str(tmp_path), parse_svc=parse_svc))
+        now = 1000
+        sha256 = "a" * 64
+        short_id = "aaaaaaa"
+        await db.execute(
+            "INSERT INTO docs (sha256, short_id, size_bytes, file_type, page_count, first_seen_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sha256, short_id, 12, "pdf", 1, now, now),
+        )
+        await db.execute(
+            "INSERT INTO files (path, filename, ext, size_bytes, mtime_ms, sha256, status, first_seen_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(tmp_path / "doc.pdf"), "doc.pdf", "pdf", 12, now, sha256, "active", now, now),
+        )
+        await db.execute(
+            "INSERT INTO parses (sha256, tier, page_range, status, privacy, done_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sha256, "standard", "1", "done", "local", now, now, now),
+        )
+        _write_batch(
+            tmp_path,
+            sha256,
+            "standard",
+            "1",
+            now,
+            ParseResult([_text_page("hello short id")]).to_dict(skip_defaults=True)["pages"],
+        )
+
+        doc_by_short_id = await server.get_doc(short_id, expand_files=True)
+        doc_by_sha256 = await server.get_doc(sha256, expand_files=True)
+        parses_by_short_id = await server.list_parses(doc_ref=short_id)
+        parses_by_sha256 = await server.list_parses(doc_ref=sha256)
+        missing_parses = await server.list_parses(doc_ref="ccccccc")
+        content = await server.get_doc_content(short_id, tier="standard", page_range="1")
+        export_path = tmp_path / "out.md"
+        exported = await server.export_doc_content(
+            short_id,
+            DocContentExportRequest(tier="standard", page_range="1", output=str(export_path)),
+        )
+        invalidated = await server.invalidate(InvalidateRequest(doc_ref=short_id, tier="standard"))
+
+        assert doc_by_short_id.sha256 == sha256
+        assert doc_by_short_id.short_id == short_id
+        assert doc_by_short_id.files is not None
+        assert doc_by_short_id.files[0].short_id == short_id
+        assert doc_by_sha256.short_id == short_id
+        assert parses_by_short_id.total == 1
+        assert parses_by_short_id.parses[0].sha256 == sha256
+        assert parses_by_sha256.total == 1
+        assert parses_by_sha256.parses[0].short_id == short_id
+        assert missing_parses.total == 0
+        assert content.sha256 == sha256
+        assert content.short_id == short_id
+        assert "hello short id" in content.content
+        assert exported.sha256 == sha256
+        assert exported.short_id == short_id
+        assert export_path.read_text(encoding="utf-8")
+        assert invalidated.sha256 == sha256
+        assert invalidated.short_id == short_id
+        assert invalidated.invalidated_count == 1
+
+        with pytest.raises(NotFoundError) as missing_doc_exc:
+            await server.get_doc("ccccccc")
+        assert missing_doc_exc.value.code == "doc_not_found"
+        assert missing_doc_exc.value.param == "doc_ref"
+
+    asyncio.run(_run())
+
+
+def test_get_file_by_path_missing_doclib_record_message_is_not_disk_file_not_found(tmp_path: Path) -> None:
+    class _ParseSvc:
+        async def ensure_ingested(self, path: str) -> None:
+            return None
+
+    async def _run() -> None:
+        db = _FakeDB(parses=[], file_row=None)
+        server = DoclibServer(SimpleNamespace(db=db, parse_svc=_ParseSvc()))
+
+        with pytest.raises(NotFoundError) as exc_info:
+            await server.get_file_by_path(str(tmp_path / "sample.png"))
+
+        assert exc_info.value.code == "file_not_found"
+        assert exc_info.value.param == "path"
+        assert "File record" in exc_info.value.message
+        assert "doclib" in exc_info.value.message
 
     asyncio.run(_run())
 
