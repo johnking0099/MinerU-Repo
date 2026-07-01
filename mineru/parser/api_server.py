@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import importlib
 import io
 import json
 import os
@@ -40,32 +39,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..types import Tier
 from ..version import __version__
 from . import parse_async
-from .tier import PARSER_BACKENDS, resolve_tier_and_backend
+from .tier import PARSER_BACKENDS, TierDependencyError, ensure_tier_runtime_dependencies, resolve_tier_and_backend
 
 _API_SERVER_BACKENDS = tuple(backend for backend in PARSER_BACKENDS if backend != "flash")
 _MANAGED_PARSE_SERVER_ENV = "MINERU_MANAGED_PARSE_SERVER"
 
-_STANDARD_REQUIRED_MODULES = [
-    "ftfy",
-    "shapely",
-    "pyclipper",
-    "torch",
-    "torchvision",
-    "transformers",
-]
-_PRO_REQUIRED_MODULES_COMMON = [
-    *_STANDARD_REQUIRED_MODULES,
-    "accelerate",
-]
-_PRO_REQUIRED_MODULES_BY_PLATFORM = {
-    "linux": ["vllm"],
-    "win32": ["lmdeploy", "qwen_vl_utils"],
-    "darwin": ["mlx", "mlx_vlm"],
-}
-
-
 class ParseServerStartupError(RuntimeError):
     """Raised when the parse server cannot start because of local setup."""
+
 
 # ── literal type aliases ────────────────────────────────────────────
 
@@ -1994,35 +1975,11 @@ def _model_ids_and_tiers_for_server_tier(tier: Tier) -> tuple[list[str], list[di
     ]
 
 
-def _required_modules_for_tier(tier: Tier) -> list[str]:
-    if tier == "standard":
-        return list(_STANDARD_REQUIRED_MODULES)
-    if tier == "pro":
-        return [
-            *_PRO_REQUIRED_MODULES_COMMON,
-            *_PRO_REQUIRED_MODULES_BY_PLATFORM.get(sys.platform, []),
-        ]
-    return []
-
-
 def _preflight_tier_dependencies(tier: Tier) -> None:
-    missing_modules = []
-    for module_name in _required_modules_for_tier(tier):
-        try:
-            importlib.import_module(module_name)
-        except ModuleNotFoundError as exc:
-            if exc.name not in (None, module_name):
-                raise
-            missing_modules.append(module_name)
-
-    if not missing_modules:
-        return
-
-    missing = ", ".join(missing_modules)
-    raise ParseServerStartupError(
-        f"Parse server cannot start for tier '{tier}'; missing runtime dependencies: {missing}. "
-        f"Install the required extra, for example: mineru[{tier}]."
-    )
+    try:
+        ensure_tier_runtime_dependencies(tier)
+    except TierDependencyError as exc:
+        raise ParseServerStartupError(str(exc)) from exc
 
 
 def create_app(

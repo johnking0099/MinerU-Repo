@@ -21,6 +21,7 @@ from PIL import Image
 
 from ..config import config
 from ..errors import InvalidRequestError, MineruError, NotFoundError, error_response, http_status_for
+from ..parser.tier import TierDependencyError, ensure_tier_runtime_dependencies
 from ..render import render_markdown
 from ..render.markdown import blocks_to_markdown
 from ..render.office.output import blocks_to_markdown as office_blocks_to_markdown
@@ -80,7 +81,6 @@ from .types import (
     ConfigValueResponse,
     ContentAsset,
     ContentFormat,
-    ImageFormat,
     ContentNextRequest,
     ContentRange,
     ContentRequestScope,
@@ -100,6 +100,7 @@ from .types import (
     FindResult,
     ForgetPathRequest,
     ForgetPathResponse,
+    ImageFormat,
     InvalidateRequest,
     InvalidateResponse,
     ListDocsResponse,
@@ -247,6 +248,8 @@ class DoclibServer(AsyncDoclibInterface):
         access_log_path = getattr(self.state, "access_log_path", "")
         stdout_log_path = getattr(self.state, "stdout_log_path", "")
         stderr_log_path = getattr(self.state, "stderr_log_path", "")
+        parse_server_stdout_log_path = getattr(self.state, "parse_server_stdout_log_path", "")
+        parse_server_stderr_log_path = getattr(self.state, "parse_server_stderr_log_path", "")
         sqlite_journal_mode = await _sqlite_journal_mode(self.state.db)
         health = get_health()
 
@@ -307,6 +310,8 @@ class DoclibServer(AsyncDoclibInterface):
             access_logs=_tail_log(access_log_path, lines=10),
             stdout_logs=_tail_log(stdout_log_path, lines=10),
             stderr_logs=_tail_log(stderr_log_path, lines=10),
+            parse_server_stdout_logs=_tail_log(parse_server_stdout_log_path, lines=10),
+            parse_server_stderr_logs=_tail_log(parse_server_stderr_log_path, lines=10),
         )
 
     @route("POST", "/server/shutdown", tags=("server",))
@@ -399,7 +404,9 @@ class DoclibServer(AsyncDoclibInterface):
 
         short_id = doc_row["short_id"] if doc_row else await self._short_id_for_sha256(sha256)
         count = await self.state.parse_svc.invalidate(sha256, request.tier)
-        return InvalidateResponse(target=request.target, sha256=sha256, short_id=short_id, tier=request.tier, invalidated_count=count)
+        return InvalidateResponse(
+            target=request.target, sha256=sha256, short_id=short_id, tier=request.tier, invalidated_count=count
+        )
 
     @route("POST", "/forget", tags=("files",))
     async def forget_path(self, request: ForgetPathRequest) -> ForgetPathResponse:
@@ -702,7 +709,9 @@ class DoclibServer(AsyncDoclibInterface):
             finished_dims = dims | {"status": "succeeded"}
             await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
             await _record_telemetry_duration(self.state, "content.duration_bucket.count", start_ms, dimensions=finished_dims)
-            return DocContentExportResponse(sha256=doc["sha256"], short_id=doc["short_id"], tier=request.tier, output=output_path)
+            return DocContentExportResponse(
+                sha256=doc["sha256"], short_id=doc["short_id"], tier=request.tier, output=output_path
+            )
         except Exception:
             finished_dims = dims | {"status": "failed"}
             await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
@@ -824,10 +833,31 @@ class DoclibServer(AsyncDoclibInterface):
 
     @route("PUT", "/configs/{key}", tags=("config",))
     async def set_config(self, key: str, request: ConfigSetRequest) -> ConfigSetResponse:
+        await self._validate_config_set(key, request.value)
         await self.state.config_svc.set(key, request.value)
         value = await self.state.config_svc.get(key)
         source = await self.state.config_svc.get_source(key)
         return ConfigSetResponse(key=key, value=_mask_config_value(key, value or ""), source=source)
+
+    async def _validate_config_set(self, key: str, value: str) -> None:
+        if key == "parse_server.local.mode":
+            if value not in ("disabled", "managed", "self_hosted"):
+                raise InvalidRequestError(
+                    "invalid_config_value",
+                    "parse_server.local.mode must be one of: disabled, managed, self_hosted.",
+                    key,
+                )
+            if value == "managed":
+                tier = _validate_managed_parse_server_tier(
+                    (await self.state.config_svc.get("parse_server.local.managed_tier")) or "standard",
+                    "parse_server.local.managed_tier",
+                )
+                _ensure_managed_parse_server_tier_available(tier, key)
+            return
+
+        if key == "parse_server.local.managed_tier":
+            tier = _validate_managed_parse_server_tier(value, key)
+            _ensure_managed_parse_server_tier_available(tier, key)
 
     @route("DELETE", "/configs/{key}", tags=("config",))
     async def unset_config(self, key: str) -> ConfigUnsetResponse:
@@ -1304,7 +1334,9 @@ class DoclibServer(AsyncDoclibInterface):
                     raise NotFoundError("block_not_found", f"Block {plan.target.block_no} not found.", "locator")
                 if _is_empty_bbox(block.bbox):
                     raise InvalidRequestError("bbox_not_available", "Block bbox is not available for image output.", "locator")
-                image_bytes = _transcode_image_bytes(doc.crop_image(block.bbox, plan.target.page_no - 1, scale=2), plan.image_format)
+                image_bytes = _transcode_image_bytes(
+                    doc.crop_image(block.bbox, plan.target.page_no - 1, scale=2), plan.image_format
+                )
                 width, height = _image_size_from_bytes(image_bytes)
         return _write_temp_asset(
             self.state.data_dir,
@@ -1489,6 +1521,23 @@ def _parse_server_status(
             supported_tiers=health.remote_supported_tiers,
         ),
     )
+
+
+def _ensure_managed_parse_server_tier_available(tier: Tier, param: str) -> None:
+    try:
+        ensure_tier_runtime_dependencies(tier)
+    except TierDependencyError as exc:
+        raise InvalidRequestError("parse_server_dependency_missing", str(exc), param) from exc
+
+
+def _validate_managed_parse_server_tier(value: str, param: str) -> Tier:
+    if value not in ("standard", "pro"):
+        raise InvalidRequestError(
+            "invalid_config_value",
+            "parse_server.local.managed_tier must be one of: standard, pro.",
+            param,
+        )
+    return cast(Tier, value)
 
 
 def _port_from_url(url: str | None) -> int | None:

@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 import mineru.parser.api_client as api_client
 import mineru.parser.api_server as api_server
+import mineru.parser.tier as parser_tier
 from mineru.parser.api_client import MinerUApiParser, _pages_from_middle_json, _parse_result_from_job, should_trust_env_for_url
 from mineru.parser import parse, parse_async
 from mineru.parser.base import ParseResult
@@ -732,7 +733,7 @@ def test_api_server_preflights_pro_tier_dependencies_for_platform(
         return object()
 
     monkeypatch.setattr(importlib, "import_module", fake_import_module)
-    monkeypatch.setattr(api_server.sys, "platform", "darwin")
+    monkeypatch.setattr(parser_tier.sys, "platform", "darwin")
 
     create_app(upload_dir=str(tmp_path), tier="pro")
 
@@ -758,6 +759,7 @@ def test_api_server_preflight_rejects_missing_tier_dependency(
         return object()
 
     monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(parser_tier.importlib_metadata, "packages_distributions", lambda: {"mineru": ["mineru"]})
 
     with pytest.raises(api_server.ParseServerStartupError, match="tier 'standard'.*torch.*mineru\\[standard\\]"):
         create_app(upload_dir=str(tmp_path), tier="standard")
@@ -770,14 +772,16 @@ def test_api_server_cli_reports_dependency_preflight_without_traceback(monkeypat
         return object()
 
     monkeypatch.setattr(importlib, "import_module", fake_import_module)
-    monkeypatch.setattr(api_server.sys, "platform", "darwin")
+    monkeypatch.setattr(parser_tier.importlib_metadata, "packages_distributions", lambda: {"mineru": ["mineru-next-dev"]})
+    monkeypatch.setattr(parser_tier.sys, "platform", "darwin")
 
     result = runner.invoke(main, ["--tier", "pro"])
 
     assert result.exit_code == 1
     assert result.output == (
         "Error: Parse server cannot start for tier 'pro'; missing runtime dependencies: mlx. "
-        "Install the required extra, for example: mineru[pro].\n"
+        "Install optional dependencies for this tier in the same Python environment as MinerU, "
+        "for example: pip install 'mineru-next-dev[pro]'.\n"
     )
     assert "Traceback" not in result.output
 
