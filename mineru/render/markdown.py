@@ -97,11 +97,11 @@ def _build_image_link(block: Block, target_span_type: str, img_bucket_path: str)
 
 
 def _render_table_block_as_markdown_table(para_block: Block, img_bucket_path: str) -> str:
-    rendered = merge_visual_para_text(para_block, img_bucket_path)
     for span in para_block.all_spans():
-        if span.type != ContentType.TABLE or not span.html:
+        if span.type != ContentType.TABLE:
             continue
-        candidate = to_markdown_table(span.html)
-        if candidate != span.html.strip():
-            return candidate
-    return rendered
+        table_html = span.content
+        if not table_html:
+            continue
+        return to_markdown_table(table_html)
+    return merge_visual_para_text(para_block, img_bucket_path)
