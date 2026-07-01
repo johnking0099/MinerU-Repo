@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import importlib
+import io
 import json
 import os
 import pathlib
@@ -21,22 +23,49 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any, AsyncIterator, Callable, Literal
 
 import click
+import httpx
+import uvicorn
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response, status
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..types import Tier
+from ..version import __version__
+from . import parse_async
 from .tier import PARSER_BACKENDS, resolve_tier_and_backend
 
 _API_SERVER_BACKENDS = tuple(backend for backend in PARSER_BACKENDS if backend != "flash")
 _MANAGED_PARSE_SERVER_ENV = "MINERU_MANAGED_PARSE_SERVER"
+
+_STANDARD_REQUIRED_MODULES = [
+    "ftfy",
+    "shapely",
+    "pyclipper",
+    "torch",
+    "torchvision",
+    "transformers",
+]
+_PRO_REQUIRED_MODULES_COMMON = [
+    *_STANDARD_REQUIRED_MODULES,
+    "accelerate",
+]
+_PRO_REQUIRED_MODULES_BY_PLATFORM = {
+    "linux": ["vllm"],
+    "win32": ["lmdeploy", "qwen_vl_utils"],
+    "darwin": ["mlx", "mlx_vlm"],
+}
+
+
+class ParseServerStartupError(RuntimeError):
+    """Raised when the parse server cannot start because of local setup."""
 
 # ── literal type aliases ────────────────────────────────────────────
 
@@ -930,13 +959,15 @@ _OUTPUT_FORMATS_LOCAL = {
     "zip",
 }
 
-_IMAGE_SIDECAR_FORMATS = frozenset({
-    "markdown",
-    "middle_json",
-    "content_list",
-    "structured_content",
-    "images",
-})
+_IMAGE_SIDECAR_FORMATS = frozenset(
+    {
+        "markdown",
+        "middle_json",
+        "content_list",
+        "structured_content",
+        "images",
+    }
+)
 
 
 def _needs_image_outputs(out_formats: set[OutputFormat] | set[str]) -> bool:
@@ -1189,8 +1220,6 @@ async def _extract_bytes(source: FileSource, file_store: FileStore, *, url_timeo
             raise ValueError("File has no content")
         return file_store.read_blob(rec.sha256sum)
     if isinstance(source, UrlSource):
-        import httpx
-
         async with httpx.AsyncClient(timeout=url_timeout) as cli:
             r = await cli.get(source.url)
             r.raise_for_status()
@@ -1242,8 +1271,6 @@ async def _run_job(
 
                 page_range = entry.page_range or ""
 
-                from . import parse_async
-
                 result = await parse_async(
                     str(tmp_path),
                     tier=rec.tier,
@@ -1260,9 +1287,7 @@ async def _run_job(
                 out_formats = set(rec.output_formats)
                 output_files = OutputFiles()
                 image_output_refs = (
-                    _store_image_outputs(file_store, result.images())
-                    if _needs_image_outputs(out_formats)
-                    else None
+                    _store_image_outputs(file_store, result.images()) if _needs_image_outputs(out_formats) else None
                 )
                 if image_output_refs is not None:
                     output_files.images = image_output_refs
@@ -1306,11 +1331,8 @@ async def _run_job(
 
                 # zip
                 if "zip" in out_formats:
-                    import io as _io
-                    import zipfile as _zipfile
-
-                    buf = _io.BytesIO()
-                    with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                         for fmt_name, attr in [
                             ("markdown", "markdown"),
                             ("middle_json", "middle_json"),
@@ -1341,7 +1363,6 @@ async def _run_job(
                 fr.status = "completed"
                 fr.page_range = _page_range_from_result_pages(result.pages)
                 fr.output_files = output_files
-                from ..version import __version__
 
                 fr.parse = FileParseInfo(
                     model_used=None,
@@ -1394,9 +1415,11 @@ _ERR_429: dict[int | str, dict[str, Any]] = {429: {"model": ErrorResponse}}
 )
 async def get_health() -> HealthResponse:
     """Health check endpoint."""
-    from ..version import __version__
-
-    return HealthResponse(version=__version__, parser_version=__version__, models=ModelHealthStatus())
+    return HealthResponse(
+        version=__version__,
+        parser_version=__version__,
+        models=ModelHealthStatus(),
+    )
 
 
 # ── Models ───────────────────────────────────────────────────────────
@@ -1971,6 +1994,37 @@ def _model_ids_and_tiers_for_server_tier(tier: Tier) -> tuple[list[str], list[di
     ]
 
 
+def _required_modules_for_tier(tier: Tier) -> list[str]:
+    if tier == "standard":
+        return list(_STANDARD_REQUIRED_MODULES)
+    if tier == "pro":
+        return [
+            *_PRO_REQUIRED_MODULES_COMMON,
+            *_PRO_REQUIRED_MODULES_BY_PLATFORM.get(sys.platform, []),
+        ]
+    return []
+
+
+def _preflight_tier_dependencies(tier: Tier) -> None:
+    missing_modules = []
+    for module_name in _required_modules_for_tier(tier):
+        try:
+            importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name not in (None, module_name):
+                raise
+            missing_modules.append(module_name)
+
+    if not missing_modules:
+        return
+
+    missing = ", ".join(missing_modules)
+    raise ParseServerStartupError(
+        f"Parse server cannot start for tier '{tier}'; missing runtime dependencies: {missing}. "
+        f"Install the required extra, for example: mineru[{tier}]."
+    )
+
+
 def create_app(
     *,
     upload_dir: str = "",
@@ -2021,6 +2075,7 @@ def create_app(
     """
     upload_dir = upload_dir or ""
     tier, backend = _resolve_server_tier_and_backend(tier=tier, backend=backend)
+    _preflight_tier_dependencies(tier)
     _api_key: str | None = api_key or None
     _upload_dir = pathlib.Path(upload_dir) if upload_dir else pathlib.Path(tempfile.mkdtemp(prefix="mineru_"))
     _upload_dir.mkdir(parents=True, exist_ok=True)
@@ -2103,6 +2158,7 @@ def create_app(
     application.include_router(_build_v1_router())
     return application
 
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 
@@ -2183,22 +2239,24 @@ def main(
     api_key: str | None,
 ) -> None:
     """Start the MinerU v1 REST API server."""
-    import uvicorn
+    try:
+        app = create_app(
+            upload_dir=upload_dir,
+            tier=tier,
+            backend=backend,
+            concurrency=concurrency,
+            url_timeout=url_timeout,
+            max_wait=max_wait,
+            api_key=api_key,
+            language=language,
+            ocr_mode=ocr_mode,
+            table_enable=not disable_table,
+            formula_enable=not disable_formula,
+            image_analysis=not disable_image_analysis,
+        )
+    except ParseServerStartupError as exc:
+        raise click.ClickException(str(exc)) from None
 
-    app = create_app(
-        upload_dir=upload_dir,
-        tier=tier,
-        backend=backend,
-        concurrency=concurrency,
-        url_timeout=url_timeout,
-        max_wait=max_wait,
-        api_key=api_key,
-        language=language,
-        ocr_mode=ocr_mode,
-        table_enable=not disable_table,
-        formula_enable=not disable_formula,
-        image_analysis=not disable_image_analysis,
-    )
     config = uvicorn.Config(
         app,
         host=host,
@@ -2214,54 +2272,5 @@ if __name__ == "__main__":
 
 __all__ = [
     "create_app",
-    # enums (Literal aliases)
-    "JobStatus",
-    "FileStatus",
-    "UploadStatus",
-    "Tier",
-    "AccessLevel",
-    "OutputFormat",
-    "SourceType",
-    "FilePurpose",
-    "SSEEventType",
-    # request models
-    "CreateUploadRequest",
-    "CompleteUploadRequest",
-    "CreateJobRequest",
-    "JobFileEntry",
-    "CallbackConfig",
-    # source models
-    "FileIdSource",
-    "UrlSource",
-    "InlineSource",
-    "LocalSource",
-    "FileSource",
-    # response models
-    "ErrorDetail",
-    "ErrorResponse",
-    "HealthFeatures",
-    "HealthResponse",
-    "ModelInfo",
-    "ModelListResponse",
-    "TierInfo",
-    "TierListResponse",
-    "UploadResponse",
-    "FileObjectModel",
-    "FileDeletionResponse",
-    "FileListResponse",
-    "JobAsyncResponse",
-    "JobLinks",
-    "JobProgress",
-    "FileParseInfo",
-    "OutputFileRef",
-    "ImageOutputRef",
-    "OutputFiles",
-    "JobFileResult",
-    "JobListItem",
-    "JobListResponse",
-    "JobCancelResponse",
-    "UsageBillingPeriod",
-    "UsageCurrent",
-    "UsageLimits",
-    "UsageResponse",
+    "main",
 ]
