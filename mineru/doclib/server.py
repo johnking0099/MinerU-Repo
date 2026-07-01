@@ -80,6 +80,7 @@ from .types import (
     ConfigValueResponse,
     ContentAsset,
     ContentFormat,
+    ImageFormat,
     ContentNextRequest,
     ContentRange,
     ContentRequestScope,
@@ -168,6 +169,7 @@ class _ReadPlan:
     limit: int
     format: ContentFormat
     no_marker: bool
+    image_format: ImageFormat = "jpeg"
     target: ContentCursor | None = None
     next_mode: str = "parse"
 
@@ -567,6 +569,7 @@ class DoclibServer(AsyncDoclibInterface):
         context: int = 0,
         limit: int = 30000,
         format: ContentFormat = "markdown",
+        image_format: ImageFormat = "jpeg",
         no_marker: bool = False,
     ) -> DocContentResponse:
         start_ms = _now_ms()
@@ -579,6 +582,7 @@ class DoclibServer(AsyncDoclibInterface):
                     context=context,
                     limit=limit,
                     format=format,
+                    image_format=image_format,
                     no_marker=no_marker,
                 )
             )
@@ -634,6 +638,7 @@ class DoclibServer(AsyncDoclibInterface):
         context: int,
         limit: int,
         format: ContentFormat,
+        image_format: ImageFormat,
         no_marker: bool,
     ) -> _ReadPlan:
         limit = max(1, limit)
@@ -662,6 +667,7 @@ class DoclibServer(AsyncDoclibInterface):
             context=context,
             limit=limit,
             format=format,
+            image_format=image_format,
             no_marker=no_marker,
             target=ContentCursor(
                 short_id=doc["short_id"],
@@ -1195,6 +1201,7 @@ class DoclibServer(AsyncDoclibInterface):
                 limit=plan.limit,
                 locator=plan.locator,
                 context=plan.context,
+                image_format=plan.image_format,
             ),
             content_ranges=[ContentRange(page_range=str(plan.target.page_no), start=target_ref, end=target_ref)],
             truncated=False,
@@ -1284,7 +1291,7 @@ class DoclibServer(AsyncDoclibInterface):
         with PDFDocument(pdf_bytes) as doc:
             if plan.target.block_no is None:
                 image = doc.render_page(plan.target.page_no - 1, scale=2).pil_image
-                image_bytes = _pil_image_to_bytes(image)
+                image_bytes = _pil_image_to_bytes(image, plan.image_format)
                 width, height = image.size
             else:
                 block = _find_block_by_no(page, plan.target.block_no)
@@ -1292,10 +1299,16 @@ class DoclibServer(AsyncDoclibInterface):
                     raise NotFoundError("block_not_found", f"Block {plan.target.block_no} not found.", "locator")
                 if _is_empty_bbox(block.bbox):
                     raise InvalidRequestError("bbox_not_available", "Block bbox is not available for image output.", "locator")
-                image_bytes = doc.crop_image(block.bbox, plan.target.page_no - 1, scale=2)
+                image_bytes = _transcode_image_bytes(doc.crop_image(block.bbox, plan.target.page_no - 1, scale=2), plan.image_format)
                 width, height = _image_size_from_bytes(image_bytes)
         return _write_temp_asset(
-            self.state.data_dir, plan.short_id, "jpg", image_bytes, mime_type="image/jpeg", width=width, height=height
+            self.state.data_dir,
+            plan.short_id,
+            _image_format_ext(plan.image_format),
+            image_bytes,
+            mime_type=_mime_type_for_image_format(plan.image_format),
+            width=width,
+            height=height,
         )
 
     async def _render_office_image_asset(self, plan: _ReadPlan, page: PageInfo) -> ContentAsset:
@@ -1309,19 +1322,24 @@ class DoclibServer(AsyncDoclibInterface):
             raise InvalidRequestError(
                 "format_not_supported", "Office image output is only supported for image blocks.", "format"
             )
-        image_bytes, ext, mime_type = _span_image_bytes(image_span)
+        image_bytes, _, _ = _span_image_bytes(image_span)
         if image_bytes is None and image_span.image_path:
             image_dir = parse_image_sidecar_dir(self.state.data_dir, plan.sha256, plan.tier)
             candidate = resolve_image_sidecar_path(image_dir, image_span.image_path)
             if candidate is not None and candidate.is_file():
                 image_bytes = candidate.read_bytes()
-                ext = candidate.suffix.lstrip(".") or "png"
-                mime_type = _mime_type_for_ext(ext)
         if image_bytes is None:
             raise NotFoundError("asset_not_available", "Office image asset is not available.", "locator")
+        image_bytes = _transcode_image_bytes(image_bytes, plan.image_format)
         width, height = _image_size_from_bytes(image_bytes)
         return _write_temp_asset(
-            self.state.data_dir, plan.short_id, ext or "png", image_bytes, mime_type=mime_type, width=width, height=height
+            self.state.data_dir,
+            plan.short_id,
+            _image_format_ext(plan.image_format),
+            image_bytes,
+            mime_type=_mime_type_for_image_format(plan.image_format),
+            width=width,
+            height=height,
         )
 
 
@@ -1653,10 +1671,45 @@ def _span_image_bytes(span: Span) -> tuple[bytes | None, str, str]:
         return None, ext, _mime_type_for_ext(ext)
 
 
-def _pil_image_to_bytes(image: Image.Image) -> bytes:
+_PIL_IMAGE_FORMATS: dict[ImageFormat, str] = {
+    "jpeg": "JPEG",
+    "png": "PNG",
+    "webp": "WEBP",
+}
+
+_IMAGE_FORMAT_EXTENSIONS: dict[ImageFormat, str] = {
+    "jpeg": "jpg",
+    "png": "png",
+    "webp": "webp",
+}
+
+_IMAGE_FORMAT_MIME_TYPES: dict[ImageFormat, str] = {
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+}
+
+
+def _pil_image_to_bytes(image: Image.Image, image_format: ImageFormat) -> bytes:
+    output_image = image
+    if image_format == "jpeg" and image.mode != "RGB":
+        output_image = image.convert("RGB")
     with BytesIO() as buffer:
-        image.save(buffer, format="JPEG")
+        output_image.save(buffer, format=_PIL_IMAGE_FORMATS[image_format])
         return buffer.getvalue()
+
+
+def _transcode_image_bytes(image_bytes: bytes, image_format: ImageFormat) -> bytes:
+    with Image.open(BytesIO(image_bytes)) as image:
+        return _pil_image_to_bytes(image, image_format)
+
+
+def _image_format_ext(image_format: ImageFormat) -> str:
+    return _IMAGE_FORMAT_EXTENSIONS[image_format]
+
+
+def _mime_type_for_image_format(image_format: ImageFormat) -> str:
+    return _IMAGE_FORMAT_MIME_TYPES[image_format]
 
 
 def _image_size_from_bytes(image_bytes: bytes) -> tuple[int | None, int | None]:
