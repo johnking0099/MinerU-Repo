@@ -67,6 +67,7 @@ _PRO_REQUIRED_MODULES_BY_PLATFORM = {
 class ParseServerStartupError(RuntimeError):
     """Raised when the parse server cannot start because of local setup."""
 
+
 # ── literal type aliases ────────────────────────────────────────────
 
 JobStatus = Literal["queued", "running", "completed", "partial", "failed", "canceled"]
