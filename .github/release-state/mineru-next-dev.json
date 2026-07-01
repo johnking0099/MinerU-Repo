@@ -1,7 +1,7 @@
 {
   "package": "mineru-next-dev",
-  "version": "4.0.0.dev20260627",
+  "version": "4.0.0.dev20260701",
   "source_branch": "next",
-  "source_commit": "8f1eadbf054451432051913bb99f48bdfc58b635",
-  "published_at": "2026-06-27T06:05:28Z"
+  "source_commit": "8b02e9efeb2c71b32958d32c047cef0859149a18",
+  "published_at": "2026-07-01T02:42:27Z"
 }
