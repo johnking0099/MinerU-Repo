@@ -1,13 +1,14 @@
 {
   "package": "mineru-next-dev",
-  "version": "4.0.0.dev2026070200",
+  "version": "4.0.0.dev2026070300",
   "source_branch": "next",
-  "source_commit": "f8089d2b836131d0d82181430b3de627b16e6441",
-  "published_at": "2026-07-02T06:13:04Z",
+  "source_commit": "225fdba063f46cebd8bedba76b95e0f9a00f122d",
+  "published_at": "2026-07-03T02:43:36Z",
   "last_auto_date": "2026-07-02",
   "daily_sequences": {
     "20260701": 0,
-    "20260702": 0
+    "20260702": 0,
+    "20260703": 0
   },
   "releases": [
     {
@@ -23,6 +24,13 @@
       "source_commit": "f8089d2b836131d0d82181430b3de627b16e6441",
       "trigger": "schedule",
       "published_at": "2026-07-02T06:13:04Z"
+    },
+    {
+      "version": "4.0.0.dev2026070300",
+      "source_branch": "next",
+      "source_commit": "225fdba063f46cebd8bedba76b95e0f9a00f122d",
+      "trigger": "workflow_dispatch",
+      "published_at": "2026-07-03T02:43:36Z"
     }
   ]
 }
