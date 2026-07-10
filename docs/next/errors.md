@@ -144,7 +144,13 @@ Tier 语义见 [解析 Tier](tiers.md)。本节定义 `flash`、`standard`、`pr
 | `invalid_request_error` | `not_cached` | 409 | 否 | null | `--no-wait` 且请求内容不在缓存 | `rerun_with_wait_or_submit_job` |
 | `invalid_request_error` | `cache_miss` | 409 | 否 | null | 请求强依赖缓存但缓存不存在 | `parse_document` |
 
-## 9. CLI 本地错误
+## 9. 通用服务错误
+
+| type | code | HTTP | retryable | param | 触发场景 | user_action |
+|------|------|------|:--:|-------|----------|-------------|
+| `api_error` | `server_busy` | 503 | 是 | null | server 暂时无法接收请求，或 SQLite 锁竞争在有限重试后仍未恢复 | `retry_later` |
+
+## 10. CLI 本地错误
 
 CLI 在调用 server 前或通信层面产生本地错误。它们使用同一 `error` 结构，但没有 HTTP 状态码。
 
@@ -153,12 +159,11 @@ CLI 在调用 server 前或通信层面产生本地错误。它们使用同一 `
 | `invalid_request_error` | `file_not_found` | 否 | 本地文件路径不存在 | `check_path` |
 | `invalid_request_error` | `file_permission_denied` | 否 | 本地文件无读取权限 | `fix_file_permission` |
 | `api_error` | `server_not_running` | 是 | CLI 无法连接 doclib UDS | `run_mineru_server_start` |
-| `api_error` | `server_busy` | 是 | server 队列满或无法接收新任务 | `retry_later` |
 | `api_error` | `server_protocol_error` | 是 | CLI 与 server 协议不兼容或响应损坏 | `upgrade_or_restart_server` |
 
 CLI 在 TTY 中可以用表格或 rich 文本展示，但非 TTY、`--json` 或 Agent 调用场景应输出结构化错误。
 
-## 10. 示例
+## 11. 示例
 
 ### 默认选择无可用质量 tier
 
@@ -208,7 +213,7 @@ CLI 在 TTY 中可以用表格或 rich 文本展示，但非 TTY、`--json` 或 
 }
 ```
 
-## 11. SDK 映射
+## 12. SDK 映射
 
 SDK 应暴露结构化异常，而不是只抛出字符串。
 
@@ -226,7 +231,7 @@ class MinerUError(Exception):
 
 SDK 可以按 `type` 提供子类，例如 `MinerUEngineError`、`MinerUInvalidRequestError`，但必须保留原始 `code`。
 
-## 12. OpenAI 兼容性
+## 13. OpenAI 兼容性
 
 | 维度 | OpenAI | MinerU |
 |------|--------|--------|

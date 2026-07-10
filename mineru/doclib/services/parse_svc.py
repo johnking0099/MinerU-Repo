@@ -652,7 +652,8 @@ class ParseService:
             (sha256, now, path),
         )
         await self.db.execute(
-            "INSERT INTO parses (sha256, tier, page_range, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?)",
+            "INSERT INTO parses (sha256, tier, page_range, status, priority, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?)",
             (sha256, tier, parse_page_range, PARSE_STATUS_PENDING, now, now),
         )
         await self._record_count("parse_task.created.count", dimensions={"tier": tier})
@@ -700,7 +701,11 @@ class ParseService:
             raise MineruError("ingest_failed", "File could not be ingested.", "path")
         sha256 = file_row["sha256"]
         if sha256 is None:
-            raise MineruError(file_row.get("error_code") or "ingest_failed", file_row.get("error_msg") or "File could not be ingested.", "path")
+            raise MineruError(
+                file_row.get("error_code") or "ingest_failed",
+                file_row.get("error_msg") or "File could not be ingested.",
+                "path",
+            )
         doc = cast(DocRow | None, await self.db.fetchone("SELECT * FROM docs WHERE sha256=?", (sha256,)))
         page_count = doc["page_count"] if doc else 1
         short_id = doc["short_id"] if doc else None
@@ -835,7 +840,7 @@ class ParseService:
         timeout = now - self.parse_lock_timeout_ms
         task = cast(
             ParseRow | None,
-            await self.db.fetchone(
+            await self.db.fetchone_write(
                 "UPDATE parses SET locked_at=?, status=? "
                 "WHERE id = ("
                 "  SELECT id FROM parses WHERE status=? "
@@ -1497,7 +1502,8 @@ def _remap_api_result_pages_to_page_range(result: ParseResult, page_range: str) 
     if len(requested_page_numbers) != len(result.pages):
         raise ParseFailure(
             "parse_page_remap_failed",
-            f"Parse result page count does not match requested page_range: requested={page_range}, returned={actual_page_numbers}",
+            "Parse result page count does not match requested page_range: "
+            f"requested={page_range}, returned={actual_page_numbers}",
         )
     for page, page_no in zip(result.pages, requested_page_numbers, strict=True):
         page.page_idx = page_no - 1

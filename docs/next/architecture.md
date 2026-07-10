@@ -171,7 +171,7 @@ metadata 更新规则：入库阶段写基础 metadata；解析完成后，只�
 | `config` | SQLite KV 配置 |
 | `_migrations` | schema 版本追踪 |
 
-SQLite 运行在 WAL 模式，使用 FTS5 提供搜索能力。每次 DB 操作打开独立 `aiosqlite` 连接，提交后关闭，避免跨 worker 游标冲突。
+SQLite 运行在 WAL 模式，使用 FTS5 提供搜索能力。每次 DB 操作打开独立 `aiosqlite` 连接，提交后关闭，避免跨 worker 游标冲突。WAL mode 只在初始化时设置；运行期连接配置显式 busy timeout。单 doclib 进程内的写操作通过共享写锁串行化，普通读取保持并发；`SQLITE_BUSY` / `SQLITE_LOCKED` 使用有上限的指数退避重试，耗尽后对外返回可重试的 `server_busy`。
 
 ## 4. 数据流
 
